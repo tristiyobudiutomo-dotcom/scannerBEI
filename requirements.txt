@@ -1,4 +1,4 @@
-pandas
-requests
-ta
-yfinance
+pandas==2.2.3
+yfinance==0.2.54
+requests==2.32.3
+ta==0.11.0
