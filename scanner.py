@@ -19,11 +19,11 @@ SECTOR_FILE = "sectors.csv"
 BATCH_SIZE = 3
 REQUEST_DELAY = 3
 
-# Approx flow thresholds in IDR value terms
-STRONG_ACCUMULATION = 1_000_000_000     # >= Rp 1B net buy pressure
-MEDIUM_ACCUMULATION = 250_000_000       # >= Rp 250M
-MEDIUM_DISTRIBUTION = -250_000_000      # <= -Rp 250M
-STRONG_DISTRIBUTION = -1_000_000_000    # <= -Rp 1B
+# Flow thresholds in IDR
+STRONG_OUTFLOW = -1_000_000_000    # -1B IDR
+MEDIUM_OUTFLOW = -250_000_000      # -250M IDR
+MEDIUM_INFLOW = 250_000_000        # +250M IDR
+STRONG_INFLOW = 1_000_000_000      # +1B IDR
 
 
 def send(msg, parse_mode="Markdown"):
@@ -132,25 +132,24 @@ def get_fundamentals(ticker):
 
 def flow_score(net_flow_idr):
     """
-    net_flow_idr:
-    positif  = accumulation / net buy / bullish
-    negatif  = distribution / net sell / bearish
+    negatif = outflow / akumulasi
+    positif = inflow / distribusi
     """
     score = 0
     label = "NEUTRAL"
 
-    if net_flow_idr >= STRONG_ACCUMULATION:
+    if net_flow_idr <= STRONG_OUTFLOW:
         score += 35
-        label = "STRONG ACCUMULATION"
-    elif net_flow_idr >= MEDIUM_ACCUMULATION:
+        label = "STRONG OUTFLOW"
+    elif net_flow_idr <= MEDIUM_OUTFLOW:
         score += 20
-        label = "ACCUMULATION"
-    elif net_flow_idr <= STRONG_DISTRIBUTION:
+        label = "OUTFLOW"
+    elif net_flow_idr >= STRONG_INFLOW:
         score -= 30
-        label = "STRONG DISTRIBUTION"
-    elif net_flow_idr <= MEDIUM_DISTRIBUTION:
+        label = "STRONG INFLOW"
+    elif net_flow_idr >= MEDIUM_INFLOW:
         score -= 15
-        label = "DISTRIBUTION"
+        label = "INFLOW"
 
     return score, label
 
@@ -158,8 +157,9 @@ def flow_score(net_flow_idr):
 def get_flow_proxy(df):
     """
     Proxy flow untuk saham Indonesia:
-    - positif = akumulasi / tekanan beli
-    - negatif = distribusi / tekanan jual
+    - pakai nilai transaksi harian sebagai proksi tekanan uang besar
+    - hasil negatif = outflow pressure / akumulasi
+    - hasil positif = inflow pressure / distribusi
     """
     try:
         close = df["Close"].squeeze()
@@ -176,17 +176,14 @@ def get_flow_proxy(df):
         traded_value_today = price * vol_now
         ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
 
-        # Breakout + volume tinggi + harga di atas EMA20 => akumulasi
         if rvol >= 5 and price > ema20:
-            return traded_value_today
-        elif rvol >= 3 and price > ema20:
-            return traded_value_today * 0.5
-
-        # Weakness + volume tinggi + harga di bawah EMA20 => distribusi
-        elif rvol >= 4 and price < ema20:
-            return -traded_value_today * 0.5
-        elif rvol >= 2 and price < ema20:
             return -traded_value_today
+        elif rvol >= 3 and price > ema20:
+            return -traded_value_today * 0.5
+        elif rvol >= 4 and price < ema20:
+            return traded_value_today * 0.5
+        elif rvol >= 2 and price < ema20:
+            return traded_value_today
 
         return 0
     except Exception as e:
@@ -236,7 +233,8 @@ def load_stock_list():
     with open(STOCK_FILE, "r", encoding="utf-8") as f:
         stocks = [x.strip() for x in f if x.strip()]
 
-    return [s if s.endswith(".JK") else s + ".JK" for s in stocks]
+    stocks = [s if s.endswith(".JK") else s + ".JK" for s in stocks]
+    return stocks
 
 
 def load_sector_map():
@@ -251,9 +249,9 @@ def load_sector_map():
     return sector_map
 
 
-def send_chunked(items, kind="momentum"):
+def send_chunked(title, items, kind="momentum"):
     if kind == "momentum":
-        msg = "🔥 *BREAKOUT MOMENTUM - ACCUMULATION + BREAKOUT + RVOL*\n\n"
+        msg = "🔥 *BREAKOUT MOMENTUM - OUTFLOW + BREAKOUT + RVOL*\n\n"
     else:
         msg = "🔄 *REVERSAL EXTREME - SCALPING 3-5%*\n\n"
 
@@ -398,61 +396,49 @@ def morning_scan():
                 "flow_label": flow_label,
             }
 
-            # BREAKOUT MOMENTUM SCORE - lebih cocok buat saham Indonesia
             score_m = 0
-
-            # Volume must be real, but not too extreme only
-            if rvol >= 5:
-                score_m += 25
-            elif rvol >= 3:
-                score_m += 18
-            elif rvol >= 2:
+            if rvol > 5:
+                score_m += 35
+            elif rvol > 3:
+                score_m += 20
+            elif rvol > 2:
                 score_m += 10
 
-            # Price structure
+            if gap_pct is not None and gap_pct > 3:
+                score_m += min(30, gap_pct * 4)
+            elif gap_pct is not None and gap_pct > 0:
+                score_m += 8
+
             if breakout_high:
-                score_m += 18
-            if price > ema20:
-                score_m += 8
-            if ema20 > ema50:
-                score_m += 6
+                score_m += 15
 
-            # Flow logic - accumulation supports upside
-            score_m += flow_bonus
+            if rsi_now > 50 and rsi_now > rsi_prev:
+                score_m += 10
+            elif rsi_now > 40 and rsi_now > rsi_prev:
+                score_m += 5
 
-            # Daily movement quality
-            if gap_pct is not None and gap_pct > 0:
-                score_m += min(12, gap_pct * 2)
             if 3 < range_pct < 25:
-                score_m += 8
+                score_m += 10
             elif range_pct >= 25:
-                score_m += 4
+                score_m += 5
 
-            # RSI for momentum continuation, not overbought chase
-            if 45 <= rsi_now <= 70 and rsi_now > rsi_prev:
-                score_m += 8
-            elif rsi_now > 70:
-                score_m += 2
-            elif rsi_now < 40:
-                score_m -= 5
+            if price > ema20:
+                score_m += 5
+            if ema20 > ema50:
+                score_m += 5
 
-            # Basic fundamental support, not mandatory
-            if fundamental_flag:
-                score_m += 4
-
+            score_m += flow_bonus
             item["score"] = round(score_m, 1)
             item["tipe"] = "breakout"
 
-            # Jangan terlalu ketat - accumulation hanya penguat, bukan penjegal
             strong_flow_breakout = (
-                breakout_high
+                flow_label in ["STRONG OUTFLOW", "OUTFLOW"]
+                and breakout_high
                 and rvol >= 2.5
                 and price > ema20
-                and score_m >= 30
-                and flow_label not in ["STRONG DISTRIBUTION"]
             )
 
-            if strong_flow_breakout:
+            if score_m >= 40 and strong_flow_breakout:
                 el, sl, tp1, tp2, tp3 = level_entry(item, price, support)
                 item["entry_limit"] = el
                 item["stop_loss"] = sl
@@ -462,9 +448,7 @@ def morning_scan():
                 results_momentum.append(item)
                 all_setups.append(item)
 
-            # REVERSAL SCORE - oversold bounce
             score_r = 0
-
             if rsi_now < 22:
                 score_r += 30
             elif rsi_now < 28:
@@ -472,27 +456,18 @@ def morning_scan():
             elif rsi_now < 35:
                 score_r += 10
 
-            if rsi_now > rsi_prev:
-                score_r += 10
-
-            if rvol >= 3:
-                score_r += 10
-            elif rvol >= 2:
-                score_r += 6
+            score_r += max(0, min(20, (rsi_now - rsi_prev) * 5))
+            score_r += min(15, rvol * 3)
 
             if price < ema20:
                 score_r += 10
             if not breakout_high:
-                score_r += 8
-
+                score_r += 10
             if fundamental_flag:
-                score_r += 4
-
-            # Untuk reversal, distribution berat justru bisa jadi tanda capitulation
-            if flow_label in ["DISTRIBUTION", "STRONG DISTRIBUTION"]:
                 score_r += 5
-            elif flow_label in ["ACCUMULATION", "STRONG ACCUMULATION"]:
-                score_r -= 8
+
+            if flow_label in ["STRONG INFLOW", "INFLOW"]:
+                score_r -= 10
 
             if score_r >= 25:
                 item_rev = item.copy()
@@ -549,10 +524,10 @@ def morning_scan():
     send(regime_header)
 
     if results_momentum:
-        send_chunked(results_momentum[:8], kind="momentum")
+        send_chunked("momentum", results_momentum[:8], kind="momentum")
 
     if results_reversal:
-        send_chunked(results_reversal[:6], kind="reversal")
+        send_chunked("reversal", results_reversal[:6], kind="reversal")
 
     if failed_tickers:
         fail_msg = "⚠️ *GAGAL DI-LOAD*\n\n"
@@ -568,7 +543,7 @@ def morning_scan():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("NEUROBRO SCANNER - ACCUMULATION + BREAKOUT + RVOL")
+    print("NEUROBRO SCANNER - OUTFLOW + BREAKOUT + RVOL")
     print(f"Mulai: {datetime.now().strftime('%H:%M')}")
     print("=" * 50)
     morning_scan()
